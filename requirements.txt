@@ -1,0 +1,6 @@
+aiohttp>=3.9
+SQLAlchemy[asyncio]>=2.0.25
+aiosqlite>=0.19
+asyncpg>=0.29
+pytest>=8.0
+pytest-asyncio>=0.23

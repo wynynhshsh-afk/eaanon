@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+
+from adapters.soroush import SoroushAdapter
+from bot.handlers import BotApp
+from config import Config
+from database.session import Database
+
+log = logging.getLogger("main")
+
+
+async def poll_loop(app: BotApp, stop: asyncio.Event) -> None:
+    backoff = 1.0
+    while not stop.is_set():
+        try:
+            updates = await app.adapter.get_updates()
+            backoff = 1.0
+            if updates:
+                await asyncio.gather(*(app.handle_update(u) for u in updates))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("polling failed: %s", type(exc).__name__)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+async def periodic(fn, interval: float, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await fn()
+        except Exception:  # noqa: BLE001
+            log.exception("periodic task failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def run() -> None:
+    cfg = Config.from_env()
+    logging.basicConfig(level=cfg.log_level,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    db = Database(cfg.database_url)
+    await db.create_all()
+    adapter = SoroushAdapter(cfg.bot_token, cfg.api_base, cfg.poll_timeout)
+    await adapter.start()
+    app = BotApp(cfg, db, adapter)
+    await app.matcher.repair()
+    if not cfg.owner_id:
+        log.warning("OWNER_ID is not set; the admin panel is disabled.")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # Windows
+            pass
+
+    async def purge() -> None:
+        await app.anon.purge_old(cfg.message_retention_days)
+        app.limiter.gc()
+
+    tasks = [
+        asyncio.create_task(poll_loop(app, stop)),
+        asyncio.create_task(periodic(app.sweep_queue_once, 5, stop)),
+        asyncio.create_task(periodic(app.broadcast_tick, 3, stop)),
+        asyncio.create_task(periodic(purge, 6 * 3600, stop)),
+    ]
+    log.info("bot @%s is running", adapter.bot_username)
+    await stop.wait()
+    log.info("shutting down")
+    for t in tasks + list(app._bc_tasks.values()):
+        t.cancel()
+    await asyncio.gather(*tasks, *app._bc_tasks.values(), return_exceptions=True)
+    await adapter.close()
+    await db.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
