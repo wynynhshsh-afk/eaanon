@@ -196,6 +196,16 @@ class SoroushAdapter(Adapter):
         assert last is not None
         raise last
 
+    async def set_webhook(self, url: str) -> None:
+        await self._call("setWebhook", {"url": url, "allowed_updates": self._allowed})
+        log.info("webhook set to %s", url)
+
+    async def delete_webhook(self) -> None:
+        try:
+            await self._call("deleteWebhook", {})
+        except AdapterError as exc:
+            log.warning("deleteWebhook failed (code %s)", exc.code)
+
     async def answer_callback(self, callback_id, text=None):
         try:
             params: Dict[str, Any] = {"callback_query_id": callback_id}

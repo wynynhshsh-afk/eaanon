@@ -20,7 +20,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env     # سپس مقادیر را پر کن
 ```
-در `.env` (یا مستقیم بالای فایل `config.py`) حداقل این‌ها را تنظیم کن. اگر هر دو را پر کنی، `.env`/متغیر محیطی اولویت دارد:
+در `.env` حداقل این‌ها را تنظیم کن:
 - `SPLUS_BOT_TOKEN`: توکن از @BotFather سروش پلاس
 - `OWNER_ID`: شناسه عددی تو. اگر نمی‌دانی، ربات را بدون آن اجرا کن، در چت خصوصی `/myid` بفرست، عدد را در `.env` بگذار و دوباره اجرا کن.
 
@@ -84,7 +84,7 @@ pytest
 ## عیب‌یابی
 | مشکل | راه‌حل |
 |---|---|
-| `SPLUS_BOT_TOKEN is not set` | `.env` را بساز و توکن را بگذار، یا `SPLUS_BOT_TOKEN` را در `config.py` پر کن |
+| `SPLUS_BOT_TOKEN is not set` | `.env` را بساز و توکن را بگذار |
 | ربات جواب نمی‌دهد | لاگ `polling failed` را ببین؛ اینترنت/توکن را چک کن |
 | پنل مالک باز نمی‌شود | `OWNER_ID` عددی و درست باشد؛ `/myid` بزن |
 | دکمه‌ها متنی شده‌اند | لاگ `inline keyboard rejected` یعنی API دکمه را نپذیرفته؛ ساختار را با مستندات تطبیق بده |

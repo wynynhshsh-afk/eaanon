@@ -4,13 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# تنظیم مستقیم در همین فایل (اختیاری)
-# اگر مقدار را در .env یا متغیر محیطی هم بدهی، همان اولویت دارد.
-# ---------------------------------------------------------------------------
-SPLUS_BOT_TOKEN = "70672303:oY1EOzDtCIKjHAA8nX3jYxsQVrcxkFaz6oM"   # توکن ربات از @BotFather سروش پلاس
-OWNER_ID = "64621354"          # شناسه عددی مالک (مثلاً "123456789")
-
 
 def load_dotenv(path: str = ".env") -> None:
     p = Path(path)
@@ -50,22 +43,26 @@ class Config:
     allow_media: bool
     message_retention_days: int
     log_level: str
+    webhook_url: str = ""
+    webhook_path: str = ""
+    webhook_secret: str = ""
+    port: int = 8080
 
     @classmethod
     def from_env(cls, require_token: bool = True) -> "Config":
         load_dotenv()
-        token = (
-            _str("SPLUS_BOT_TOKEN")
-            or _str("BOT_TOKEN")
-            or str(SPLUS_BOT_TOKEN).strip()
-        )
+        token = _str("SPLUS_BOT_TOKEN") or _str("BOT_TOKEN")
         if require_token and not token:
-            raise SystemExit(
-                "SPLUS_BOT_TOKEN is not set (set it in .env or config.py)."
-            )
-        owner = _str("OWNER_ID") or str(OWNER_ID).strip()
+            raise SystemExit("SPLUS_BOT_TOKEN is not set (see .env.example).")
+        owner = _str("OWNER_ID")
         if owner and not owner.isdigit():
             raise SystemExit("OWNER_ID must be the numeric user id.")
+        secret = _str("WEBHOOK_SECRET")
+        if not secret and token:
+            # یک مقدار پایدار از خود توکن می‌سازیم تا نیازی به تنظیم دستی نباشه،
+            # ولی override با WEBHOOK_SECRET همیشه ارجحه.
+            import hashlib
+            secret = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
         return cls(
             bot_token=token,
             owner_id=owner,
@@ -79,4 +76,8 @@ class Config:
             allow_media=_str("ALLOW_MEDIA", "1") not in ("0", "false", "no"),
             message_retention_days=_int("MESSAGE_RETENTION_DAYS", 90),
             log_level=_str("LOG_LEVEL", "INFO").upper(),
+            webhook_url=_str("WEBHOOK_URL"),
+            webhook_path=_str("WEBHOOK_PATH", f"/webhook/{secret}"),
+            webhook_secret=secret,
+            port=_int("PORT", 8080),
         )
