@@ -6,10 +6,12 @@ from typing import List, Optional, Sequence, Union
 
 
 class AdapterError(Exception):
-    def __init__(self, message: str, code: Optional[int] = None, retryable: bool = False):
+    def __init__(self, message: str, code: Optional[int] = None, retryable: bool = False,
+                 description: str = ""):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.description = description
 
     @property
     def user_blocked_bot(self) -> bool:
@@ -34,6 +36,9 @@ class IncomingMessage:
     text: str = ""
     media_type: Optional[str] = None
     file_name: Optional[str] = None
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
 
 
 @dataclass
@@ -43,6 +48,9 @@ class IncomingCallback:
     user_id: str
     message_id: str
     data: str
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
 
 
 Update = Union[IncomingMessage, IncomingCallback]
@@ -67,4 +75,14 @@ class Adapter(ABC):
         return None
 
     async def relay_media(self, to_chat_id: str, from_chat_id: str, message_id: str) -> bool:
+        return False
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, text: str, keyboard: Optional[Keyboard] = None
+    ) -> bool:
+        """پیام موجود را ویرایش می‌کند. False یعنی ویرایش نشد (فراخوان پیام جدید می‌فرستد)."""
+        return False
+
+    async def send_document(self, chat_id: str, filename: str, data: bytes,
+                            caption: str = "") -> bool:
         return False

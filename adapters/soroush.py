@@ -64,6 +64,9 @@ def parse_update(raw: Any) -> Optional[Update]:
             text=str(field(message, "text") or field(message, "caption") or ""),
             media_type=media,
             file_name=str(field(doc, "file_name", "")) if isinstance(doc, dict) else None,
+            first_name=str(field(sender, "first_name", "") or ""),
+            last_name=str(field(sender, "last_name", "") or ""),
+            username=str(field(sender, "username", "") or ""),
         )
     cb = field(raw, "callback_query")
     if isinstance(cb, dict):
@@ -78,6 +81,9 @@ def parse_update(raw: Any) -> Optional[Update]:
             user_id=str(field(sender, "id")),
             message_id=str(field(msg, "message_id", "")),
             data=str(field(cb, "data", "")),
+            first_name=str(field(sender, "first_name", "") or ""),
+            last_name=str(field(sender, "last_name", "") or ""),
+            username=str(field(sender, "username", "") or ""),
         )
     return None
 
@@ -140,7 +146,8 @@ class SoroushAdapter(Adapter):
             except (TypeError, ValueError):
                 code = None
             raise AdapterError(f"{method} rejected (code {code})", code=code,
-                               retryable=bool(code and code >= 500) or code == 429)
+                               retryable=bool(code and code >= 500) or code == 429,
+                               description=str(field(payload, "description", "") or ""))
         return field(payload, "result")
 
     async def get_updates(self) -> List[Update]:
@@ -170,9 +177,7 @@ class SoroushAdapter(Adapter):
         params: Dict[str, Any] = {"chat_id": _chat_id(chat_id), "text": text}
         use_markup = bool(keyboard) and self.inline_ok
         if use_markup:
-            params["reply_markup"] = {"inline_keyboard": [
-                [{"text": b.text, "callback_data": b.data} for b in row] for row in keyboard
-            ]}
+            params["reply_markup"] = self._markup(keyboard)
         elif keyboard:
             params["text"] = with_labels(text, keyboard)
         last: Optional[AdapterError] = None
@@ -195,6 +200,51 @@ class SoroushAdapter(Adapter):
                 await asyncio.sleep(1.5 * (attempt + 1))
         assert last is not None
         raise last
+
+    @staticmethod
+    def _markup(keyboard: Keyboard) -> Dict[str, Any]:
+        return {"inline_keyboard": [
+            [{"text": b.text, "callback_data": b.data} for b in row] for row in keyboard
+        ]}
+
+    async def edit_message(self, chat_id, message_id, text, keyboard=None) -> bool:
+        """ویرایش پیام فعلی به‌جای ارسال پیام جدید (editMessageText، فرض مشابه تلگرام)."""
+        if not message_id:
+            return False
+        params: Dict[str, Any] = {"chat_id": _chat_id(chat_id),
+                                  "message_id": _chat_id(message_id), "text": text}
+        if keyboard and self.inline_ok:
+            params["reply_markup"] = self._markup(keyboard)
+        elif keyboard:
+            params["text"] = with_labels(text, keyboard)
+        try:
+            await self._call("editMessageText", params)
+            return True
+        except AdapterError as exc:
+            if exc.code == 400 and "not modified" in exc.description.lower():
+                return True  # محتوا عوض نشده؛ پیام همون صفحه‌ست
+            log.info("editMessageText failed (code %s): %s", exc.code, exc.description)
+            return False
+
+    async def send_document(self, chat_id, filename, data, caption="") -> bool:
+        assert self._http is not None
+        url = f"{self._base}{quote(self._token, safe=':')}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+        form.add_field("document", data, filename=filename, content_type="text/html")
+        try:
+            async with self._http.post(url, data=form,
+                                       timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            log.warning("sendDocument failed (%s)", type(exc).__name__)
+            return False
+        ok = field(payload, "ok", False) is True
+        if not ok:
+            log.warning("sendDocument rejected: %s", field(payload, "description", ""))
+        return ok
 
     async def set_webhook(self, url: str) -> None:
         await self._call("setWebhook", {"url": url, "allowed_updates": self._allowed})

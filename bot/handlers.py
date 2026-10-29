@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional, Set
 
@@ -23,6 +25,17 @@ from .settings import SettingsService
 from .users import UserService
 
 log = logging.getLogger("bot")
+
+
+@dataclass
+class _EditTarget:
+    """پیامی که دکمهٔ فشرده‌شده روی آن بوده؛ اولین پاسخ همان پیام را ویرایش می‌کند."""
+    chat_id: str
+    message_id: str
+    used: bool = False
+
+
+_EDIT: ContextVar[Optional[_EditTarget]] = ContextVar("edit_target", default=None)
 
 MAX_ANON_LEN = 2000
 BLOCKED_EXT = {"exe", "apk", "bat", "cmd", "scr", "msi", "com", "jar", "vbs", "js", "ps1",
@@ -52,7 +65,29 @@ class BotApp:
     def is_owner(self, platform_id: str) -> bool:
         return bool(self.cfg.owner_id) and platform_id == self.cfg.owner_id
 
-    async def say(self, chat_id: str, text: str, kb: Optional[Keyboard] = None) -> bool:
+    def use_edit(self, chat_id: str, message_id: Optional[str]) -> None:
+        """اولین say بعدی به همین چت، پیام message_id را ویرایش می‌کند (نه پیام جدید)."""
+        _EDIT.set(_EditTarget(str(chat_id), str(message_id)) if message_id else None)
+
+    def current_message_id(self) -> str:
+        tgt = _EDIT.get()
+        return tgt.message_id if tgt else ""
+
+    async def say(self, chat_id: str, text: str, kb: Optional[Keyboard] = None,
+                  new: bool = False) -> bool:
+        """اگه این پاسخ به فشردن یک دکمه باشه، همون پیام ویرایش می‌شه؛ وگرنه پیام جدید.
+
+        new=True یعنی همیشه پیام جدید (اعلان‌ها و هشدارها).
+        """
+        tgt = _EDIT.get()
+        if (not new and tgt is not None and not tgt.used and tgt.chat_id == str(chat_id)
+                and tgt.message_id):
+            tgt.used = True
+            try:
+                if await self.adapter.edit_message(chat_id, tgt.message_id, text, kb):
+                    return True
+            except AdapterError as exc:
+                log.info("edit failed (code %s); sending new message", exc.code)
         try:
             await self.adapter.send_message(chat_id, text, kb)
             return True
@@ -60,9 +95,10 @@ class BotApp:
             log.warning("send failed (code %s)", exc.code)
             return False
 
-    async def notify(self, user_id: int, text: str, kb: Optional[Keyboard] = None) -> bool:
+    async def notify(self, user_id: int, text: str, kb: Optional[Keyboard] = None,
+                     new: bool = False) -> bool:
         chat_id = await self.users.chat_id_of(user_id)
-        return bool(chat_id) and await self.say(chat_id, text, kb)
+        return bool(chat_id) and await self.say(chat_id, text, kb, new=new)
 
     async def menu(self, chat_id: str, text: Optional[str] = None) -> None:
         await self.say(chat_id, text or await self.settings.get("welcome_text"), K.main_menu())
@@ -71,6 +107,7 @@ class BotApp:
     async def handle_update(self, update: Update) -> None:
         lock = self._locks.setdefault(update.user_id, asyncio.Lock())
         async with lock:
+            token = _EDIT.set(None)
             try:
                 if isinstance(update, IncomingCallback):
                     await self._on_callback(update)
@@ -78,6 +115,8 @@ class BotApp:
                     await self._on_message(update)
             except Exception:  # noqa: BLE001
                 log.exception("update handling failed")
+            finally:
+                _EDIT.reset(token)
 
     async def _gate(self, user: User, chat_id: str) -> bool:
         """بن و محدودیت سرعت. True یعنی ادامه بده."""
@@ -86,13 +125,14 @@ class BotApp:
             if ban:
                 until = f"\nتا: {ban.until:%Y-%m-%d %H:%M}" if ban.until else ""
                 if self.limiter.allow(f"banmsg:{user.id}", 1, 30):
-                    await self.say(chat_id, f"حساب شما مسدود شده.\nدلیل: {ban.reason or '-'}{until}")
+                    await self.say(chat_id, f"حساب شما مسدود شده.\nدلیل: {ban.reason or '-'}{until}",
+                                   new=True)
                 return False
         limit = await self.settings.get_int("rate_limit_messages")
         window = await self.settings.get_int("rate_limit_window")
         if not self.limiter.allow(f"msg:{user.id}", limit, window):
             if self.limiter.allow(f"warn:{user.id}", 1, window):
-                await self.say(chat_id, "آروم‌تر! پیام‌هات خیلی سریع می‌رسن.")
+                await self.say(chat_id, "آروم‌تر! پیام‌هات خیلی سریع می‌رسن.", new=True)
             return False
         return True
 
@@ -100,7 +140,8 @@ class BotApp:
     async def _on_message(self, m: IncomingMessage) -> None:
         if m.chat_type not in ("private", ""):
             return
-        user = await self.users.get_or_create(m.user_id, m.chat_id)
+        user = await self.users.get_or_create(m.user_id, m.chat_id, m.first_name,
+                                              m.last_name, m.username)
         chat_id = m.chat_id
         if not await self._gate(user, chat_id):
             return
@@ -142,8 +183,9 @@ class BotApp:
         if user.state == "waiting":
             await self.matcher.leave(user.id)
         await self.users.set_state(user.id, "idle")
-        if arg.startswith(PAYLOAD_PREFIX):
-            return await self._anon_begin(user, chat_id, arg[len(PAYLOAD_PREFIX):])
+        payload = arg.split()[0] if arg.split() else ""
+        if payload.isdigit() or payload.startswith(PAYLOAD_PREFIX):
+            return await self._anon_begin(user, chat_id, payload)
         await self.menu(chat_id)
 
     async def _cancel(self, user: User, chat_id: str) -> None:
@@ -156,7 +198,9 @@ class BotApp:
 
     # ---------- callbacks ----------
     async def _on_callback(self, cb: IncomingCallback) -> None:
-        user = await self.users.get_or_create(cb.user_id, cb.chat_id)
+        user = await self.users.get_or_create(cb.user_id, cb.chat_id, cb.first_name,
+                                              cb.last_name, cb.username)
+        self.use_edit(cb.chat_id, cb.message_id)  # پاسخ به دکمه = ویرایش همین پیام
         await self.adapter.answer_callback(cb.callback_id)
         if not await self._gate(user, cb.chat_id):
             return
@@ -178,7 +222,7 @@ class BotApp:
             if rest == "random":
                 return await self._random_start(user, chat_id)
             if rest == "link":
-                return await self._link_show(user, chat_id, False)
+                return await self._link_show(user, chat_id)
             if rest == "inbox":
                 return await self._inbox(user, chat_id, 0)
             if rest == "help":
@@ -192,8 +236,8 @@ class BotApp:
             return await self._random_join(user, chat_id, rest)
         elif kind == "chat" and rest == "end":
             return await self.end_chat(user, chat_id)
-        elif kind == "link" and rest == "new":
-            return await self._link_show(user, chat_id, True)
+        elif kind == "link":
+            return await self._link_show(user, chat_id)
         elif kind == "inbox":
             return await self._inbox(user, chat_id, int(rest or 0))
         elif kind == "view":
@@ -271,27 +315,28 @@ class BotApp:
         return len(expired)
 
     # ---------- anonymous link ----------
-    async def _link_show(self, user: User, chat_id: str, regenerate: bool) -> None:
+    async def _link_show(self, user: User, chat_id: str) -> None:
         if not await self.settings.get_bool("anon_links_enabled"):
             return await self.say(chat_id, "لینک ناشناس فعلاً غیرفعاله.", K.to_menu())
-        link = await (self.anon.regenerate(user.id) if regenerate else self.anon.get_link(user.id))
-        url = self.anon.url(link.token, self.adapter.bot_username)
-        head = "لینک جدیدت ساخته شد (لینک قبلی باطل شد)." if regenerate else "لینک ناشناس اختصاصی تو:"
-        await self.say(chat_id, f"{head}\n\n{url}\n\nهر کی از این لینک وارد بشه می‌تونه بدون اسم بهت پیام بده.",
+        url = self.anon.url(user.platform_id, self.adapter.bot_username)
+        await self.say(chat_id, f"لینک ناشناس اختصاصی تو:\n\n{url}\n\n"
+                                "هر کی از این لینک وارد بشه می‌تونه بدون اسم بهت پیام بده.\n"
+                                "این لینک ثابته و با جابه‌جایی ربات از بین نمی‌ره.",
                        K.link_view())
 
-    async def _anon_begin(self, user: User, chat_id: str, token: str) -> None:
+    async def _anon_begin(self, user: User, chat_id: str, payload: str) -> None:
         if not await self.settings.get_bool("anon_links_enabled"):
             return await self.menu(chat_id, "لینک ناشناس فعلاً غیرفعاله.")
-        link = await self.anon.resolve(token)
-        if link is None or await self.users.active_ban(link.user_id):
+        target = await self.anon.resolve_target(payload)
+        if target is None or await self.users.active_ban(target[0]):
             return await self.menu(chat_id, "این لینک معتبر نیست یا باطل شده.")
-        if link.user_id == user.id:
+        owner_id, link_id = target
+        if owner_id == user.id:
             return await self.menu(chat_id, "این لینک خودته! بده به بقیه تا بهت پیام بدن.")
-        if await self.anon.is_blocked(link.user_id, user.id):
+        if await self.anon.is_blocked(owner_id, user.id):
             return await self.menu(chat_id, "فعلاً امکان ارسال پیام به این شخص نیست.")
         await self.users.set_state(user.id, "composing_anon",
-                                   {"owner_id": link.user_id, "link_id": link.id})
+                                   {"owner_id": owner_id, "link_id": link_id})
         await self.say(chat_id, T.ANON_WELCOME, K.cancel_only())
 
     async def _anon_send(self, user: User, m: IncomingMessage, text: str) -> None:
@@ -350,11 +395,13 @@ class BotApp:
             return await self.say(chat_id, "این پیام وجود نداره.", K.to_menu())
         if await self.anon.is_blocked(msg.sender_id, user.id):
             return await self.say(chat_id, "فعلاً امکان پاسخ به این پیام نیست.", K.to_menu())
-        await self.users.set_state(user.id, "replying", {"msg_id": msg_id})
+        await self.users.set_state(user.id, "replying",
+                                   {"msg_id": msg_id, "pm": self.current_message_id()})
         await self.say(chat_id, "پاسخت رو بنویس. فرستنده هویتت رو نمی‌بینه.", K.cancel_only())
 
     async def _anon_reply(self, user: User, m: IncomingMessage, text: str) -> None:
         chat_id = m.chat_id
+        self.use_edit(chat_id, self.users.data_of(user).get("pm"))  # پیام «پاسخت رو بنویس» ویرایش می‌شه
         if m.media_type or not text:
             return await self.say(chat_id, "فعلاً فقط پاسخ متنی پشتیبانی می‌شه.", K.cancel_only())
         if len(text) > MAX_ANON_LEN:
@@ -383,8 +430,19 @@ class BotApp:
         msg = await self.anon.get_for_recipient(msg_id, user.id)
         if msg is None:
             return await self.say(chat_id, "این پیام وجود نداره.", K.to_menu())
-        await self.anon.report(user.id, msg, "گزارش از صندوق پیام")
+        rep = await self.anon.report(user.id, msg, "گزارش از صندوق پیام")
         await self.say(chat_id, "گزارشت ثبت شد. ممنون!", K.to_menu())
+        await self._notify_owner_report(rep.id)
+
+    async def _notify_owner_report(self, report_id: int) -> None:
+        """گزارش را با مشخصات کامل و دکمه‌های اقدام برای مالک می‌فرستد (همیشه پیام جدید)."""
+        if not self.cfg.owner_id:
+            return
+        owner = await self.users.by_platform(self.cfg.owner_id)
+        view = await self.panel.report_view(report_id, header="🚨 گزارش تخلف جدید")
+        if owner is None or view is None:
+            return
+        await self.notify(owner.id, view[0], view[1], new=True)
 
     async def _delete(self, user: User, chat_id: str, msg_id: int, offset: int) -> None:
         await self.anon.delete(msg_id, user.id)
@@ -409,7 +467,7 @@ class BotApp:
         counts = await self.ads.run(job_id, self._send_ad, self.cfg.broadcast_rate)
         status = await self.ads.status(job_id)
         if self.cfg.owner_id and status in ("done", "cancelled"):
-            owner = await self.users.find(self.cfg.owner_id)
+            owner = await self.users.by_platform(self.cfg.owner_id)
             if owner:
                 await self.notify(owner.id, (
                     f"گزارش تبلیغ #{job_id} ({'تموم شد' if status == 'done' else 'لغو شد'})\n"

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import select
-
-from database.models import BotSetting
-from database.session import Database
+from database.models import BotSetting, iso, utcnow
+from database.session import Database, eq
 from . import texts
 
 DEFAULTS = {
@@ -21,9 +19,8 @@ class SettingsService:
         self.db = db
 
     async def get(self, key: str) -> str:
-        async with self.db.tx() as s:
-            row = await s.get(BotSetting, key)
-            return row.value if row else DEFAULTS[key]
+        row = await self.db.one("bot_settings", BotSetting, where=eq(key=key))
+        return row.value if row else DEFAULTS[key]
 
     async def get_int(self, key: str) -> int:
         try:
@@ -37,16 +34,12 @@ class SettingsService:
     async def set(self, key: str, value: str) -> None:
         if key not in DEFAULTS:
             raise KeyError(key)
-        async with self.db.tx() as s:
-            row = await s.get(BotSetting, key)
-            if row:
-                row.value = value
-            else:
-                s.add(BotSetting(key=key, value=value))
+        await self.db.upsert("bot_settings",
+                             {"key": key, "value": value, "updated_at": iso(utcnow())},
+                             on_conflict="key")
 
     async def all(self) -> dict:
-        async with self.db.tx() as s:
-            rows = (await s.execute(select(BotSetting))).scalars().all()
+        rows = await self.db.rows("bot_settings", BotSetting)
         out = dict(DEFAULTS)
         out.update({r.key: r.value for r in rows})
         return out

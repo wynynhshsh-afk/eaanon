@@ -43,7 +43,7 @@ def to_menu() -> Keyboard:
 
 
 def link_view() -> Keyboard:
-    return [[Button(T.BTN_NEW_LINK, "link:new")], [Button(T.BTN_MENU, "menu:home")]]
+    return [[Button(T.BTN_MENU, "menu:home")]]
 
 
 def view_message(msg_id: int) -> Keyboard:

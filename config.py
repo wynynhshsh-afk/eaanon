@@ -35,7 +35,8 @@ def _str(name: str, default: str = "") -> str:
 class Config:
     bot_token: str
     owner_id: str
-    database_url: str
+    supabase_url: str
+    supabase_key: str
     api_base: str
     link_template: str
     poll_timeout: int
@@ -66,7 +67,8 @@ class Config:
         return cls(
             bot_token=token,
             owner_id=owner,
-            database_url=_str("DATABASE_URL", "sqlite+aiosqlite:///./bot.db"),
+            supabase_url=_str("SUPABASE_URL").rstrip("/"),
+            supabase_key=_str("SUPABASE_KEY"),
             api_base=_str("API_BASE", "https://api.splus.ir/bot"),
             link_template=_str(
                 "LINK_TEMPLATE", "https://splus.ir/{bot_username}?start={payload}"

@@ -4,16 +4,12 @@ import secrets
 from datetime import timedelta
 from typing import Optional, Tuple
 
-from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import IntegrityError
-
 from config import Config
-from database.models import (
-    AnonymousLink, AnonymousMessage, Block, Report, utcnow,
-)
-from database.session import Database
+from database.models import AnonymousLink, AnonymousMessage, Report, User, iso, utcnow
+from database.session import Database, eq, is_unique_violation
 
 PAYLOAD_PREFIX = "a_"
+_LIVE = ("received", "delivered")
 
 
 class AnonymousService:
@@ -23,132 +19,116 @@ class AnonymousService:
 
     # --- links ---
     async def get_link(self, user_id: int) -> AnonymousLink:
-        async with self.db.tx() as s:
-            link = (await s.execute(select(AnonymousLink).where(
-                AnonymousLink.user_id == user_id, AnonymousLink.revoked.is_(False)
-            ).limit(1))).scalars().first()
-            if link is None:
-                link = AnonymousLink(user_id=user_id, token=secrets.token_urlsafe(12))
-                s.add(link)
-                await s.flush()
-            return link
+        link = await self.db.one("anonymous_links", AnonymousLink,
+                                 where=eq(user_id=user_id, revoked=False))
+        if link is None:
+            link = await self.db.insert("anonymous_links", {
+                "user_id": user_id, "token": secrets.token_urlsafe(12)}, AnonymousLink)
+        return link
 
     async def regenerate(self, user_id: int) -> AnonymousLink:
-        async with self.db.tx() as s:
-            await s.execute(update(AnonymousLink).where(
-                AnonymousLink.user_id == user_id, AnonymousLink.revoked.is_(False)
-            ).values(revoked=True, updated_at=utcnow()))
-            link = AnonymousLink(user_id=user_id, token=secrets.token_urlsafe(12))
-            s.add(link)
-            await s.flush()
-            return link
+        await self.db.update("anonymous_links", {"revoked": True},
+                             eq(user_id=user_id, revoked=False))
+        return await self.db.insert("anonymous_links", {
+            "user_id": user_id, "token": secrets.token_urlsafe(12)}, AnonymousLink)
 
     async def resolve(self, token: str) -> Optional[AnonymousLink]:
+        """لینک‌های قدیمی توکنی (a_TOKEN)؛ برای سازگاری با لینک‌های منتشرشده نگه داشته شده."""
         if not token or len(token) > 64:
             return None
-        async with self.db.tx() as s:
-            return (await s.execute(select(AnonymousLink).where(
-                AnonymousLink.token == token, AnonymousLink.revoked.is_(False)
-            ))).scalars().first()
+        return await self.db.one("anonymous_links", AnonymousLink,
+                                 where=eq(token=token, revoked=False))
 
-    def url(self, token: str, bot_username: str) -> str:
-        return self.cfg.link_template.format(
-            bot_username=bot_username, payload=PAYLOAD_PREFIX + token)
+    async def resolve_target(self, payload: str) -> Optional[Tuple[int, Optional[int]]]:
+        """(user_id, link_id) صاحب لینک.
+
+        لینک جدید = شناسهٔ عددی پیام‌رسان (`?start=64621354`) که به سرور وابسته نیست.
+        لینک قدیمی `a_TOKEN` هم هنوز کار می‌کنه.
+        """
+        payload = (payload or "").strip()
+        if not payload or len(payload) > 64:
+            return None
+        if payload.isdigit():
+            row = await self.db.one("users", where=eq(platform_id=payload), cols="id")
+            return (int(row["id"]), None) if row else None
+        if payload.startswith(PAYLOAD_PREFIX):
+            link = await self.resolve(payload[len(PAYLOAD_PREFIX):])
+            return (link.user_id, link.id) if link else None
+        return None
+
+    def url(self, platform_id: str, bot_username: str) -> str:
+        return self.cfg.link_template.format(bot_username=bot_username, payload=platform_id)
 
     # --- blocks ---
     async def is_blocked(self, blocker_id: int, blocked_id: int) -> bool:
-        async with self.db.tx() as s:
-            return (await s.execute(select(Block.id).where(
-                Block.blocker_id == blocker_id, Block.blocked_id == blocked_id
-            ).limit(1))).first() is not None
+        return await self.db.one("blocks", where=eq(blocker_id=blocker_id, blocked_id=blocked_id),
+                                 cols="id") is not None
 
     async def block(self, blocker_id: int, blocked_id: int) -> None:
         try:
-            async with self.db.tx() as s:
-                exists = (await s.execute(select(Block.id).where(
-                    Block.blocker_id == blocker_id, Block.blocked_id == blocked_id
-                ))).first()
-                if not exists:
-                    s.add(Block(blocker_id=blocker_id, blocked_id=blocked_id))
-        except IntegrityError:
-            pass
+            await self.db.upsert("blocks", {"blocker_id": blocker_id, "blocked_id": blocked_id},
+                                 on_conflict="blocker_id,blocked_id", ignore_duplicates=True)
+        except Exception as exc:  # noqa: BLE001
+            if not is_unique_violation(exc):
+                raise
 
     # --- messages ---
     async def create_message(self, sender_id: int, recipient_id: int, text: str,
                              link_id: Optional[int] = None,
                              parent_id: Optional[int] = None) -> AnonymousMessage:
-        async with self.db.tx() as s:
-            msg = AnonymousMessage(sender_id=sender_id, recipient_id=recipient_id,
-                                   text=text, link_id=link_id, parent_id=parent_id)
-            s.add(msg)
-            await s.flush()
-            return msg
+        row = await self.db.rpc("anon_create_message", {
+            "p_sender": sender_id, "p_recipient": recipient_id, "p_text": text,
+            "p_link_id": link_id, "p_parent_id": parent_id})
+        return AnonymousMessage.from_row(row)
 
     async def set_status(self, msg_id: int, status: str) -> None:
-        async with self.db.tx() as s:
-            await s.execute(update(AnonymousMessage).where(AnonymousMessage.id == msg_id)
-                            .values(status=status, updated_at=utcnow()))
+        await self.db.update("anonymous_messages", {"status": status}, eq(id=msg_id))
+
+    async def _owned(self, msg_id: int, user_id: int) -> Optional[AnonymousMessage]:
+        msg = await self.db.one("anonymous_messages", AnonymousMessage, where=eq(id=msg_id))
+        if msg is None or msg.recipient_id != user_id or msg.status == "deleted":
+            return None
+        return msg
 
     async def get_for_recipient(self, msg_id: int, user_id: int) -> Optional[AnonymousMessage]:
-        async with self.db.tx() as s:
-            msg = await s.get(AnonymousMessage, msg_id)
-            if msg is None or msg.recipient_id != user_id or msg.status == "deleted":
-                return None
-            return msg
+        return await self._owned(msg_id, user_id)
 
     async def mark_seen(self, msg_id: int, user_id: int) -> Tuple[Optional[AnonymousMessage], bool]:
         """(پیام, آیا همین الان برای اولین بار دیده شد)."""
-        async with self.db.tx() as s:
-            msg = await s.get(AnonymousMessage, msg_id)
-            if msg is None or msg.recipient_id != user_id or msg.status == "deleted":
-                return None, False
-            r = await s.execute(update(AnonymousMessage).where(
-                AnonymousMessage.id == msg_id,
-                AnonymousMessage.status.in_(("received", "delivered")),
-            ).values(status="seen", seen_at=utcnow(), updated_at=utcnow()))
-            first = bool(r.rowcount)
-            await s.refresh(msg)
-            return msg, first
+        if await self._owned(msg_id, user_id) is None:
+            return None, False
+        now = iso(utcnow())
+        changed = await self.db.update(
+            "anonymous_messages", {"status": "seen", "seen_at": now},
+            [("id", "eq", msg_id), ("status", "in", _LIVE)])
+        msg = await self.db.one("anonymous_messages", AnonymousMessage, where=eq(id=msg_id))
+        return msg, bool(changed)
 
     async def inbox_page(self, user_id: int, offset: int) -> Tuple[Optional[AnonymousMessage], int]:
-        async with self.db.tx() as s:
-            base = (AnonymousMessage.recipient_id == user_id, AnonymousMessage.status != "deleted")
-            total = (await s.execute(select(func.count(AnonymousMessage.id)).where(*base))).scalar_one()
-            if total == 0:
-                return None, 0
-            offset = max(0, min(offset, total - 1))
-            msg = (await s.execute(select(AnonymousMessage).where(*base)
-                                   .order_by(AnonymousMessage.id.desc())
-                                   .offset(offset).limit(1))).scalars().first()
-            return msg, total
+        base = [("recipient_id", "eq", user_id), ("status", "neq", "deleted")]
+        total = await self.db.count("anonymous_messages", base)
+        if total == 0:
+            return None, 0
+        offset = max(0, min(offset, total - 1))
+        msg = await self.db.one("anonymous_messages", AnonymousMessage, where=base,
+                                order="id", desc=True, offset=offset)
+        return msg, total
 
     async def unread_count(self, user_id: int) -> int:
-        async with self.db.tx() as s:
-            return (await s.execute(select(func.count(AnonymousMessage.id)).where(
-                AnonymousMessage.recipient_id == user_id,
-                AnonymousMessage.status.in_(("received", "delivered"))))).scalar_one()
+        return await self.db.count("anonymous_messages",
+                                   [("recipient_id", "eq", user_id), ("status", "in", _LIVE)])
 
     async def delete(self, msg_id: int, user_id: int) -> bool:
-        async with self.db.tx() as s:
-            r = await s.execute(update(AnonymousMessage).where(
-                AnonymousMessage.id == msg_id, AnonymousMessage.recipient_id == user_id,
-                AnonymousMessage.status != "deleted",
-            ).values(status="deleted", text="", updated_at=utcnow()))
-            return bool(r.rowcount)
+        rows = await self.db.update(
+            "anonymous_messages", {"status": "deleted", "text": ""},
+            [("id", "eq", msg_id), ("recipient_id", "eq", user_id), ("status", "neq", "deleted")])
+        return bool(rows)
 
-    async def report(self, reporter_id: int, msg: AnonymousMessage, reason: str) -> None:
-        async with self.db.tx() as s:
-            s.add(Report(reporter_id=reporter_id, reported_id=msg.sender_id,
-                         message_id=msg.id, reason=reason[:200]))
+    async def report(self, reporter_id: int, msg: AnonymousMessage, reason: str) -> Report:
+        return await self.db.insert("reports", {
+            "reporter_id": reporter_id, "reported_id": msg.sender_id,
+            "message_id": msg.id, "reason": reason[:200]}, Report)
 
     async def purge_old(self, days: int) -> int:
         cutoff = utcnow() - timedelta(days=days)
-        async with self.db.tx() as s:
-            used = select(Report.message_id).where(Report.status == "open",
-                                                   Report.message_id.is_not(None))
-            parents = select(AnonymousMessage.parent_id).where(
-                AnonymousMessage.parent_id.is_not(None))
-            r = await s.execute(delete(AnonymousMessage).where(
-                AnonymousMessage.created_at < cutoff,
-                AnonymousMessage.id.notin_(used), AnonymousMessage.id.notin_(parents)))
-            return r.rowcount or 0
+        return int(await self.db.rpc("anon_purge_old", {"p_cutoff": iso(cutoff)}) or 0)

@@ -14,7 +14,9 @@ services:
         value: https://anonbot.onrender.com
       - key: WEBHOOK_SECRET
         generateValue: true
-      - key: DATABASE_URL
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
         sync: false
       - key: LOG_LEVEL
         value: INFO

@@ -18,6 +18,10 @@ class FakeAdapter(Adapter):
         self.media_ok = True
         self.relayed: List[Tuple[str, str, str]] = []
         self.answered: List[str] = []
+        self.edits: List[Tuple[str, str, str, Optional[Keyboard]]] = []
+        self.documents: List[Tuple[str, str, bytes, str]] = []
+        self.edit_ok = True
+        self.doc_ok = True
         self._mid = 0
 
     async def get_updates(self) -> List[Update]:
@@ -40,7 +44,25 @@ class FakeAdapter(Adapter):
         self.relayed.append((str(to_chat_id), str(from_chat_id), str(message_id)))
         return True
 
+    async def edit_message(self, chat_id, message_id, text, keyboard=None):
+        if not self.edit_ok or str(chat_id) in self.fail_for:
+            return False
+        self.edits.append((str(chat_id), str(message_id), text, keyboard))
+        self.sent.append((str(chat_id), text, keyboard))  # آخرین وضعیت صفحه
+        return True
+
+    async def send_document(self, chat_id, filename, data, caption=""):
+        if not self.doc_ok:
+            return False
+        self.documents.append((str(chat_id), filename, data, caption))
+        return True
+
     # --- helpers for tests ---
+    @property
+    def new_sends(self) -> int:
+        """تعداد پیام‌های واقعاً جدید (بدون ویرایش‌ها)."""
+        return len(self.sent) - len(self.edits)
+
     def texts_to(self, chat_id: str) -> List[str]:
         return [t for c, t, _ in self.sent if c == str(chat_id)]
 

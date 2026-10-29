@@ -58,7 +58,7 @@ async def run(stop: asyncio.Event | None = None) -> None:
     cfg = Config.from_env()
     logging.basicConfig(level=cfg.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    db = Database(cfg.database_url)
+    db = Database(cfg.supabase_url, cfg.supabase_key)
     await db.create_all()
 
     adapter = SoroushAdapter(cfg.bot_token, cfg.api_base, cfg.poll_timeout)

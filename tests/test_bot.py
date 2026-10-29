@@ -1,18 +1,20 @@
 import asyncio
 from datetime import timedelta
 
-from sqlalchemy import func, select
-
-from adapters.base import AdapterError
+from adapters.base import AdapterError, IncomingMessage
 from bot.ratelimit import RateLimiter
 from database.models import (
-    ActiveChat, AnonymousMessage, BroadcastRecipient, QueueEntry, User, utcnow,
+    ActiveChat, AnonymousMessage, BroadcastRecipient, MessageLog, QueueEntry, User, utcnow,
 )
+from database.session import eq
 
 
 async def user_row(h, pid):
-    async with h.db.tx() as s:
-        return (await s.execute(select(User).where(User.platform_id == str(pid)))).scalar_one()
+    return await h.db.one("users", User, where=eq(platform_id=str(pid)))
+
+
+async def queue_size(h):
+    return await h.db.count("matching_queue")
 
 
 async def test_new_user_gets_menu(h):
@@ -27,8 +29,7 @@ async def test_gender_saved_and_no_queue_before_valid_choice(h):
     await h.click(1, "menu:random")
     assert h.fake.last_to("1")[0] == "جنسیت خودت رو مشخص کن."
     await h.click(1, "w:any")  # انتخاب نامعتبر در این مرحله
-    async with h.db.tx() as s:
-        assert (await s.execute(select(func.count(QueueEntry.user_id)))).scalar_one() == 0
+    assert await queue_size(h) == 0
     await h.click(1, "g:male")
     assert (await user_row(h, 1)).gender == "male"
     assert h.fake.last_to("1")[0] == "برات مهمه مخاطبت پسره یا دختر؟"
@@ -61,13 +62,11 @@ async def test_timeout_and_cleanup(h):
 async def test_duplicate_join_does_not_reset_timer_or_double_connect(h):
     await h.say(1, "/start")
     await h.connect(1, "male", "any")
-    async with h.db.tx() as s:
-        first = (await s.get(QueueEntry, (await user_row(h, 1)).id)).expires_at
-    await h.app.matcher.join((await user_row(h, 1)).id)
-    async with h.db.tx() as s:
-        again = (await s.get(QueueEntry, (await user_row(h, 1)).id)).expires_at
-        n = (await s.execute(select(func.count(QueueEntry.user_id)))).scalar_one()
-    assert first == again and n == 1
+    uid = (await user_row(h, 1)).id
+    first = (await h.db.one("matching_queue", QueueEntry, where=eq(user_id=uid))).expires_at
+    await h.app.matcher.join(uid)
+    again = (await h.db.one("matching_queue", QueueEntry, where=eq(user_id=uid))).expires_at
+    assert first == again and await queue_size(h) == 1
 
 
 async def test_concurrent_matching_no_double_connect(h):
@@ -81,8 +80,7 @@ async def test_concurrent_matching_no_double_connect(h):
     rows = [await user_row(h, i) for i in ids]
     results = await asyncio.gather(*(h.app.matcher.join(u.id) for u in rows))
     assert sum(r.status == "matched" for r in results) == 10
-    async with h.db.tx() as s:
-        chats = (await s.execute(select(ActiveChat))).scalars().all()
+    chats = await h.db.rows("active_chats", ActiveChat)
     members = [m for c in chats for m in (c.user_a, c.user_b)]
     assert len(members) == len(set(members)) == 20
 
@@ -113,21 +111,27 @@ async def test_media_relay_and_dangerous_file(h):
     assert "پشتیبانی نمی‌شه" in h.fake.texts_to("1")[-1]
 
 
-async def test_link_generate_recover_after_restart(h):
+async def test_link_is_numeric_id_and_survives_restart(h):
     await h.say(5, "/start")
     await h.click(5, "menu:link")
-    text = h.fake.texts_to("5")[-1]
-    token_url = [w for w in text.split() if w.startswith("https://")][0]
-    assert "start=a_" in token_url
-    h2 = await h.restart()
+    url = [w for w in h.fake.texts_to("5")[-1].split() if w.startswith("https://")][0]
+    assert url == "https://splus.ir/testbot?start=5"
+    h2 = await h.restart()  # شبیه جابه‌جایی ربات: لینک فقط به شناسه عددی وابسته‌ست
     await h2.click(5, "menu:link")
-    assert token_url in h2.fake.texts_to("5")[-1]
-    await h2.click(5, "link:new")
-    new_url = [w for w in h2.fake.texts_to("5")[-1].split() if w.startswith("https://")][0]
-    assert new_url != token_url
-    await h2.say(6, "/start " + token_url.split("start=")[1])  # لینک باطل
-    assert "معتبر نیست" in h2.fake.texts_to("6")[-1]
+    assert url in h2.fake.texts_to("5")[-1]
+    await h2.say(6, "/start 5")
+    assert h2.fake.texts_to("6")[-1] == "سلام! می‌تونی پیام ناشناست رو برای این شخص بفرستی."
+    await h2.say(7, "/start 999999")  # کاربری با این شناسه وجود نداره
+    assert "معتبر نیست" in h2.fake.texts_to("7")[-1]
     await h2.db.dispose()
+
+
+async def test_legacy_token_link_still_works(h):
+    await h.say(5, "/start")
+    owner = await user_row(h, 5)
+    link = await h.app.anon.get_link(owner.id)
+    await h.say(6, f"/start a_{link.token}")
+    assert h.fake.texts_to("6")[-1] == "سلام! می‌تونی پیام ناشناست رو برای این شخص بفرستی."
 
 
 async def test_anonymous_message_seen_reply_flow(h):
@@ -139,8 +143,7 @@ async def test_anonymous_message_seen_reply_flow(h):
     await h.say(11, "سلام ناشناس")
     assert "پیام ناشناس جدید" in h.fake.texts_to("10")[-1]
     mid = int(h.fake.buttons_to("10")[0].split(":")[1])
-    async with h.db.tx() as s:
-        assert (await s.get(AnonymousMessage, mid)).status == "delivered"
+    assert (await h.db.one("anonymous_messages", AnonymousMessage, where=eq(id=mid))).status == "delivered"
     assert "پیامت رو دید" not in " ".join(h.fake.texts_to("11"))  # تحویل ≠ دیده شدن
     await h.click(10, f"view:{mid}")
     assert "سلام ناشناس" in h.fake.texts_to("10")[-1]
@@ -150,8 +153,7 @@ async def test_anonymous_message_seen_reply_flow(h):
     await h.click(10, f"reply:{mid}")
     await h.say(10, "جواب من")
     assert "پاسخ ناشناس" in h.fake.texts_to("11")[-1]
-    async with h.db.tx() as s:
-        assert (await s.get(AnonymousMessage, mid)).status == "replied"
+    assert (await h.db.one("anonymous_messages", AnonymousMessage, where=eq(id=mid))).status == "replied"
     # کاربر دیگر نمی‌تواند پیام مال دیگری را ببیند
     await h.click(11, f"view:{mid}")
     assert "وجود نداره" in h.fake.texts_to("11")[-1]
@@ -175,8 +177,7 @@ async def test_inbox_navigation_unread_and_delete(h):
     assert "یک" in h.fake.texts_to("10")[-1] and "خوانده‌نشده: 0" in h.fake.texts_to("10")[-1]
     mid = int([b for b in h.fake.buttons_to("10") if b.startswith("del:")][0].split(":")[1])
     await h.click(10, f"del:{mid}:1")
-    async with h.db.tx() as s:
-        assert (await s.get(AnonymousMessage, mid)).text == ""
+    assert (await h.db.one("anonymous_messages", AnonymousMessage, where=eq(id=mid))).text == ""
 
 
 async def test_ban_unban_and_ban_evasion(h):
@@ -267,3 +268,118 @@ async def test_settings_disable_random_chat(h):
     await h.say(1, "/start")
     await h.click(1, "menu:random")
     assert "غیرفعاله" in h.fake.texts_to("1")[-1]
+
+
+async def _setup_anon(h, owner=10, sender=11):
+    await h.say(owner, "/start")
+    await h.app.handle_update(IncomingMessage(
+        chat_id=str(sender), user_id=str(sender), message_id="1", text="/start",
+        first_name="Ali", last_name="Karimi", username="ali_k"))
+    await h.app.handle_update(IncomingMessage(
+        chat_id=str(owner), user_id=str(owner), message_id="1", text="/start",
+        first_name="Sara", username="sara_r"))
+    await h.say(sender, f"/start {owner}")
+    await h.say(sender, "متن توهین‌آمیز")
+    return int([b for b in h.fake.buttons_to(str(owner)) if b.startswith("view:")][0].split(":")[1])
+
+
+async def test_buttons_edit_same_message_instead_of_sending(h):
+    await h.say(1, "/start")
+    sends = h.fake.new_sends
+    await h.click(1, "menu:help")
+    await h.click(1, "menu:home")
+    await h.click(1, "menu:link")
+    assert h.fake.new_sends == sends          # هیچ پیام جدیدی نرفت
+    assert len(h.fake.edits) == 3 and all(e[1] == "1" for e in h.fake.edits)
+    h.fake.edit_ok = False                     # اگه ویرایش ممکن نبود، پیام جدید می‌ره
+    await h.click(1, "menu:help")
+    assert h.fake.new_sends == sends + 1
+
+
+async def test_admin_panel_navigation_edits_in_place(h):
+    await h.say("9000", "/admin")
+    sends = h.fake.new_sends
+    await h.click("9000", "adm:stats")
+    await h.click("9000", "adm:home")
+    await h.click("9000", "adm:set")
+    assert h.fake.new_sends == sends and len(h.fake.edits) == 3
+
+
+async def test_messages_archived_with_full_details(h):
+    mid = await _setup_anon(h)
+    logs = await h.db.rows("message_logs", MessageLog)
+    assert len(logs) == 1
+    log = logs[0]
+    assert (log.sender_platform_id, log.sender_name, log.sender_username) == ("11", "Ali Karimi", "ali_k")
+    assert (log.recipient_platform_id, log.recipient_name, log.recipient_username) == ("10", "Sara", "sara_r")
+    assert log.text == "متن توهین‌آمیز" and log.message_id == mid and log.created_at
+    await h.click(10, f"del:{mid}:0")  # حذف توسط گیرنده، آرشیو می‌مونه
+    assert [m.text for m in await h.db.rows("message_logs", MessageLog)] == ["متن توهین‌آمیز"]
+
+
+async def test_report_goes_to_owner_with_actions(h):
+    mid = await _setup_anon(h)
+    await h.say("9000", "/start")
+    await h.click(10, f"report:{mid}")
+    text, kb = h.fake.last_to("9000")
+    for part in ("Ali Karimi", "Sara", "@ali_k", "@sara_r", "متن توهین‌آمیز"):
+        assert part in text
+    datas = [b.data for r in kb for b in r]
+    assert any(d.startswith("adm:rban:") for d in datas)
+    assert any(d.startswith("adm:rpreply:") for d in datas)
+    assert any(d.startswith("adm:rpinfo:") for d in datas)
+    rid = int([d for d in datas if d.startswith("adm:rpinfo:")][0].split(":")[2])
+
+    # ارسال مشخصات متخلف به دریافت‌کننده
+    await h.click("9000", f"adm:rpinfo:{rid}")
+    info = h.fake.texts_to("10")[-1]
+    assert "Ali Karimi" in info and "@ali_k" in info
+    # پاسخ مالک به دریافت‌کننده
+    await h.click("9000", f"adm:rpreply:{rid}")
+    await h.say("9000", "گزارشت بررسی شد")
+    assert "گزارشت بررسی شد" in h.fake.texts_to("10")[-1]
+    # بن متخلف
+    await h.click("9000", f"adm:rban:{rid}")
+    assert "مسدود" in h.fake.texts_to("11")[-1]
+    await h.say(11, "/start")
+    assert "حساب شما مسدود شده" in h.fake.texts_to("11")[-1]
+
+
+async def test_backup_html_sent_to_owner(h):
+    await _setup_anon(h)
+    await h.say("9000", "/admin")
+    await h.click("9000", "adm:backup")
+    chat, name, data, _ = h.fake.documents[-1]
+    html = data.decode("utf-8")
+    assert chat == "9000" and name.startswith("anonbot-backup-") and name.endswith(".html")
+    for part in ("Ali Karimi", "@sara_r", "متن توهین‌آمیز", "کاربران", "پیام‌ها"):
+        assert part in html
+    assert "<script>alert" not in html
+
+
+async def test_backup_escapes_html(h):
+    from adapters.base import IncomingMessage
+    from bot.backup import build_backup_html
+    await h.app.handle_update(IncomingMessage(
+        chat_id="1", user_id="1", message_id="1", text="/start",
+        first_name="<script>alert(1)</script>", username="x"))
+    html = await build_backup_html(h.db, "testbot")
+    assert "<script>alert(1)</script>" not in html and "&lt;script&gt;" in html
+
+
+def test_config_reads_only_supabase_url_and_key(monkeypatch):
+    from config import Config
+    monkeypatch.setenv("SPLUS_BOT_TOKEN", "t")
+    monkeypatch.setenv("SUPABASE_URL", "https://abc.supabase.co/")
+    monkeypatch.setenv("SUPABASE_KEY", "service-key")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = Config.from_env()
+    assert cfg.supabase_url == "https://abc.supabase.co" and cfg.supabase_key == "service-key"
+    assert not hasattr(cfg, "database_url")
+
+
+def test_database_requires_url_and_key():
+    import pytest
+    from database.session import Database
+    with pytest.raises(SystemExit):
+        Database("", "")
