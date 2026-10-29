@@ -34,16 +34,20 @@ class Database:
     که با rpc صدا زده می‌شن.
     """
 
-    def __init__(self, url: str, key: str, client: Any = None) -> None:
+    def __init__(self, url: str, key: str, client: Any = None, local: bool = False) -> None:
         if client is None:
             if not url or not key:
                 raise SystemExit("SUPABASE_URL and SUPABASE_KEY must be set (see .env.example).")
             client = create_client(url, key, options=ClientOptions(
                 postgrest_client_timeout=DB_TIMEOUT_SECONDS))
         self.client = client
+        # local=True: کلاینت یه موتور درون‌حافظه‌ای است (دور thread pool زده می‌شه، تأخیر صفر)
+        self.local = local
 
     # --- پایه ---
     async def _run(self, fn):
+        if self.local:
+            return fn()
         return await asyncio.to_thread(fn)
 
     @staticmethod
