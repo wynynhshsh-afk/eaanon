@@ -383,11 +383,7 @@ class BotApp:
             return await self.say(chat_id, "این پیام وجود نداره.", K.to_menu())
         if first:
             await self.notify(msg.sender_id, T.SEEN)
-        unread = await self.anon.unread_count(user.id)
-        head = f"پیام ناشناس ({offset + 1}/{total})\n" if in_inbox else "پیام ناشناس\n"
-        text = (f"{head}وضعیت: {STATUS_FA.get(msg.status, msg.status)}\n\n{msg.text}\n\n"
-                f"پیام‌های خوانده‌نشده: {unread}")
-        await self.say(chat_id, text, K.message_actions(msg.id, offset, total, in_inbox))
+        await self.say(chat_id, msg.text, K.message_actions(msg.id, offset, total, in_inbox))
 
     async def _reply_begin(self, user: User, chat_id: str, msg_id: int) -> None:
         msg = await self.anon.get_for_recipient(msg_id, user.id)
