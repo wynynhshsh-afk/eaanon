@@ -22,7 +22,7 @@ from .chat_manager import ChatManager
 from .matcher import Matcher
 from .ratelimit import RateLimiter
 from .settings import SettingsService
-from .users import UserService
+from .users import UserService, full_name
 
 log = logging.getLogger("bot")
 
@@ -157,6 +157,8 @@ class BotApp:
             return await self.panel.open(user, chat_id)
         if cmdl == "/cancel":
             return await self._cancel(user, chat_id)
+        if cmdl == "/newmsg":
+            return await self._inbox(user, chat_id, 0, simple=True)
 
         if user.state.startswith("admin_") and self.is_owner(user.platform_id):
             if await self.panel.on_text(user, chat_id, text):
@@ -337,7 +339,8 @@ class BotApp:
             return await self.menu(chat_id, "فعلاً امکان ارسال پیام به این شخص نیست.")
         await self.users.set_state(user.id, "composing_anon",
                                    {"owner_id": owner_id, "link_id": link_id})
-        await self.say(chat_id, T.ANON_WELCOME, K.cancel_only())
+        owner = await self.users.get(owner_id)
+        await self.say(chat_id, T.ANON_WELCOME.format(name=full_name(owner)), K.cancel_only())
 
     async def _anon_send(self, user: User, m: IncomingMessage, text: str) -> None:
         chat_id = m.chat_id
@@ -361,29 +364,29 @@ class BotApp:
         await self.menu(chat_id, "پیامت ارسال شد ✅")
 
     async def _deliver(self, msg_id: int, recipient_id: int, is_reply: bool) -> None:
-        head = "یه پاسخ ناشناس به پیامت رسید! 💬" if is_reply else "یه پیام ناشناس جدید داری! 📩"
-        if await self.notify(recipient_id, head, K.view_message(msg_id)):
+        if await self.notify(recipient_id, T.NEW_ANON_NOTICE):
             await self.anon.set_status(msg_id, "delivered")
 
     # ---------- inbox ----------
-    async def _inbox(self, user: User, chat_id: str, offset: int) -> None:
+    async def _inbox(self, user: User, chat_id: str, offset: int, simple: bool = False) -> None:
         msg, total = await self.anon.inbox_page(user.id, offset)
         if msg is None:
             return await self.say(chat_id, "صندوق پیام‌هات خالیه.", K.to_menu())
         offset = max(0, min(offset, total - 1))
-        await self._show_message(user, chat_id, msg.id, offset, total, True)
+        await self._show_message(user, chat_id, msg.id, offset, total, True, simple=simple)
 
     async def _view(self, user: User, chat_id: str, msg_id: int) -> None:
         await self._show_message(user, chat_id, msg_id, 0, 1, False)
 
     async def _show_message(self, user: User, chat_id: str, msg_id: int, offset: int,
-                            total: int, in_inbox: bool) -> None:
+                            total: int, in_inbox: bool, simple: bool = False) -> None:
         msg, first = await self.anon.mark_seen(msg_id, user.id)
         if msg is None:
             return await self.say(chat_id, "این پیام وجود نداره.", K.to_menu())
         if first:
             await self.notify(msg.sender_id, T.SEEN)
-        await self.say(chat_id, msg.text, K.message_actions(msg.id, offset, total, in_inbox))
+        kb = K.message_actions_simple(msg.id) if simple else K.message_actions(msg.id, offset, total, in_inbox)
+        await self.say(chat_id, msg.text, kb)
 
     async def _reply_begin(self, user: User, chat_id: str, msg_id: int) -> None:
         msg = await self.anon.get_for_recipient(msg_id, user.id)

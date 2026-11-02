@@ -50,6 +50,10 @@ def view_message(msg_id: int) -> Keyboard:
     return [[Button(T.BTN_VIEW, f"view:{msg_id}")]]
 
 
+def message_actions_simple(msg_id: int) -> Keyboard:
+    return [[Button(T.BTN_REPORT, f"report:{msg_id}"), Button(T.BTN_REPLY, f"reply:{msg_id}")]]
+
+
 def message_actions(msg_id: int, offset: int, total: int, in_inbox: bool) -> Keyboard:
     rows: List[List[Button]] = []
     if in_inbox:
