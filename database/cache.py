@@ -58,6 +58,9 @@ class CacheLayer:
     async def check(self) -> None:
         await self._remote.check()
 
+    async def has_column(self, table: str, column: str) -> bool:
+        return await self._remote.has_column(table, column)
+
     async def warm(self) -> None:
         store: FakeSupabase = self._local.client  # type: ignore[assignment]
         loaded: Dict[str, int] = {}

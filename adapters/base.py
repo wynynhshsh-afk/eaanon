@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 
 class AdapterError(Exception):
@@ -39,6 +39,7 @@ class IncomingMessage:
     first_name: str = ""
     last_name: str = ""
     username: str = ""
+    entities: List[Dict[str, Any]] = field(default_factory=list)  # فرمت متن (بولد، لینک، mono ...)
 
 
 @dataclass
@@ -68,7 +69,8 @@ class Adapter(ABC):
 
     @abstractmethod
     async def send_message(
-        self, chat_id: str, text: str, keyboard: Optional[Keyboard] = None
+        self, chat_id: str, text: str, keyboard: Optional[Keyboard] = None,
+        entities: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]: ...
 
     async def answer_callback(self, callback_id: str, text: Optional[str] = None) -> None:
@@ -78,7 +80,8 @@ class Adapter(ABC):
         return False
 
     async def edit_message(
-        self, chat_id: str, message_id: str, text: str, keyboard: Optional[Keyboard] = None
+        self, chat_id: str, message_id: str, text: str, keyboard: Optional[Keyboard] = None,
+        entities: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """پیام موجود را ویرایش می‌کند. False یعنی ویرایش نشد (فراخوان پیام جدید می‌فرستد)."""
         return False

@@ -68,6 +68,7 @@ async def run(stop: asyncio.Event | None = None) -> None:
     await adapter.delete_webhook()
 
     app = BotApp(cfg, db, adapter)
+    await app.anon.probe_entities()
     await app.matcher.repair()
     if not cfg.owner_id:
         log.warning("OWNER_ID is not set; the admin panel is disabled.")

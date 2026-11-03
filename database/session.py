@@ -87,6 +87,16 @@ class Database:
                     "SQL Editor اجرا کن.") from exc
             raise
 
+    async def has_column(self, table: str, column: str) -> bool:
+        """آیا ستون روی دیتابیس واقعی وجود داره؟ (قبل از نوشتن ستون‌های جدید چک می‌شه)."""
+        try:
+            await self._run(lambda: self.client.table(table).select(column).limit(1).execute())
+            return True
+        except APIError as exc:
+            if getattr(exc, "code", "") in ("42703", "PGRST204") or "does not exist" in str(exc):
+                return False
+            raise
+
     async def create_all(self) -> None:  # نام قدیمی؛ فقط بررسی اتصال
         await self.check()
 

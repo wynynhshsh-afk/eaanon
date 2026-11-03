@@ -101,6 +101,7 @@ class AnonymousMessage(Row):
     link_id: Optional[int] = None
     parent_id: Optional[int] = None
     text: str = ""
+    entities: Optional[str] = None  # JSON فرمت متن (بولد/لینک/mono)؛ ستون اختیاری
     status: str = "received"
     seen_at: Optional[datetime] = None
     created_at: Optional[datetime] = None

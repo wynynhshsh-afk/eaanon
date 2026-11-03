@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import timedelta
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from config import Config
 from database.models import AnonymousLink, AnonymousMessage, Report, User, iso, utcnow
 from database.session import Database, eq, is_unique_violation
+from . import entities as E
+
+log = logging.getLogger("anonymous")
 
 PAYLOAD_PREFIX = "a_"
 _LIVE = ("received", "delivered")
@@ -16,6 +20,20 @@ class AnonymousService:
     def __init__(self, db: Database, cfg: Config) -> None:
         self.db = db
         self.cfg = cfg
+        # ستون anonymous_messages.entities باید روی دیتابیس واقعی باشه (migrations/001_...sql)؛
+        # وگرنه نوشتنش صف write-back کش رو برای همیشه گیر می‌ندازه. probe_entities موقع استارت چک می‌کنه.
+        self.entities_enabled = True
+
+    async def probe_entities(self) -> bool:
+        try:
+            self.entities_enabled = await self.db.has_column("anonymous_messages", "entities")
+        except Exception:  # noqa: BLE001
+            log.exception("entities column probe failed; formatting storage disabled")
+            self.entities_enabled = False
+        if not self.entities_enabled:
+            log.warning("anonymous_messages.entities missing: run migrations/001_message_entities.sql "
+                        "- messages will be delivered without formatting until then")
+        return self.entities_enabled
 
     # --- links ---
     async def get_link(self, user_id: int) -> AnonymousLink:
@@ -75,11 +93,39 @@ class AnonymousService:
     # --- messages ---
     async def create_message(self, sender_id: int, recipient_id: int, text: str,
                              link_id: Optional[int] = None,
-                             parent_id: Optional[int] = None) -> AnonymousMessage:
+                             parent_id: Optional[int] = None,
+                             entities: Optional[E.Entities] = None) -> AnonymousMessage:
         row = await self.db.rpc("anon_create_message", {
             "p_sender": sender_id, "p_recipient": recipient_id, "p_text": text,
             "p_link_id": link_id, "p_parent_id": parent_id})
-        return AnonymousMessage.from_row(row)
+        msg = AnonymousMessage.from_row(row)
+        payload = E.dumps(entities or [])
+        if payload and self.entities_enabled:
+            await self.db.update("anonymous_messages", {"entities": payload}, eq(id=msg.id))
+            msg.entities = payload
+        return msg
+
+    async def awaiting_notice(self, user_id: int) -> List[int]:
+        """پیام‌هایی که هنوز اعلان «پیام جدید» براشون نرفته (status=received)، قدیمی‌ترین اول."""
+        rows = await self.db.rows(
+            "anonymous_messages", cols="id", order="id",
+            where=[("recipient_id", "eq", user_id), ("status", "eq", "received")])
+        return [int(r["id"]) for r in rows]
+
+    async def mark_delivered(self, msg_ids: List[int]) -> None:
+        if msg_ids:
+            await self.db.update("anonymous_messages", {"status": "delivered"},
+                                 [("id", "in", msg_ids), ("status", "eq", "received")])
+
+    async def unread(self, user_id: int, limit: int) -> Tuple[List[AnonymousMessage], int]:
+        """(قدیمی‌ترین `limit` پیام خوانده‌نشده، تعداد کل خوانده‌نشده‌ها)."""
+        where = [("recipient_id", "eq", user_id), ("status", "in", _LIVE)]
+        total = await self.db.count("anonymous_messages", where)
+        if total == 0:
+            return [], 0
+        rows = await self.db.rows("anonymous_messages", AnonymousMessage, where=where,
+                                  order="id", limit=limit)
+        return rows, total
 
     async def set_status(self, msg_id: int, status: str) -> None:
         await self.db.update("anonymous_messages", {"status": status}, eq(id=msg_id))
@@ -119,8 +165,11 @@ class AnonymousService:
                                    [("recipient_id", "eq", user_id), ("status", "in", _LIVE)])
 
     async def delete(self, msg_id: int, user_id: int) -> bool:
+        values = {"status": "deleted", "text": ""}
+        if self.entities_enabled:
+            values["entities"] = None
         rows = await self.db.update(
-            "anonymous_messages", {"status": "deleted", "text": ""},
+            "anonymous_messages", values,
             [("id", "eq", msg_id), ("recipient_id", "eq", user_id), ("status", "neq", "deleted")])
         return bool(rows)
 

@@ -56,6 +56,10 @@ def parse_update(raw: Any) -> Optional[Update]:
             return None
         media = next((k for k in MEDIA_KEYS if field(message, k)), None)
         doc = field(message, "document")
+        # فرمت متن: برای پیام متنی entities، برای کپشن caption_entities (فرض مشابه Bot API تلگرام)
+        raw_entities = field(message, "entities") if field(message, "text") \
+            else field(message, "caption_entities")
+        entities = [e for e in (raw_entities or []) if isinstance(e, dict)]
         return IncomingMessage(
             chat_id=str(field(chat, "id")),
             user_id=str(field(sender, "id")),
@@ -67,6 +71,7 @@ def parse_update(raw: Any) -> Optional[Update]:
             first_name=str(field(sender, "first_name", "") or ""),
             last_name=str(field(sender, "last_name", "") or ""),
             username=str(field(sender, "username", "") or ""),
+            entities=entities,
         )
     cb = field(raw, "callback_query")
     if isinstance(cb, dict):
@@ -173,21 +178,31 @@ class SoroushAdapter(Adapter):
                 updates.append(parsed)
         return updates
 
-    async def send_message(self, chat_id, text, keyboard=None):
+    async def send_message(self, chat_id, text, keyboard=None, entities=None):
         params: Dict[str, Any] = {"chat_id": _chat_id(chat_id), "text": text}
         use_markup = bool(keyboard) and self.inline_ok
+        use_entities = bool(entities)
         if use_markup:
             params["reply_markup"] = self._markup(keyboard)
         elif keyboard:
-            params["text"] = with_labels(text, keyboard)
+            params["text"] = with_labels(text, keyboard)  # برچسب‌ها ته متن میان؛ offset ها سالم می‌مونن
+        if use_entities:
+            params["entities"] = entities
         last: Optional[AdapterError] = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 result = await self._call("sendMessage", params)
                 mid = field(result, "message_id")
                 return str(mid) if mid is not None else None
             except AdapterError as exc:
                 last = exc
+                if exc.code == 400 and use_entities:
+                    # اول فرمت رو کنار می‌ذاریم (نه دکمه‌ها رو)؛ پیام باید برسه، حتی ساده.
+                    log.warning("entities rejected (%s); sending without formatting",
+                                exc.description[:120])
+                    use_entities = False
+                    params.pop("entities", None)
+                    continue
                 if exc.code == 400 and use_markup:
                     log.warning("inline keyboard rejected; falling back to text options")
                     self.inline_ok = False
@@ -207,7 +222,7 @@ class SoroushAdapter(Adapter):
             [{"text": b.text, "callback_data": b.data} for b in row] for row in keyboard
         ]}
 
-    async def edit_message(self, chat_id, message_id, text, keyboard=None) -> bool:
+    async def edit_message(self, chat_id, message_id, text, keyboard=None, entities=None) -> bool:
         """ویرایش پیام فعلی به‌جای ارسال پیام جدید (editMessageText، فرض مشابه تلگرام)."""
         if not message_id:
             return False
@@ -217,14 +232,23 @@ class SoroushAdapter(Adapter):
             params["reply_markup"] = self._markup(keyboard)
         elif keyboard:
             params["text"] = with_labels(text, keyboard)
-        try:
-            await self._call("editMessageText", params)
-            return True
-        except AdapterError as exc:
-            if exc.code == 400 and "not modified" in exc.description.lower():
-                return True  # محتوا عوض نشده؛ پیام همون صفحه‌ست
-            log.info("editMessageText failed (code %s): %s", exc.code, exc.description)
-            return False
+        if entities:
+            params["entities"] = entities
+        for use_entities in ((True, False) if entities else (False,)):
+            if not use_entities:
+                params.pop("entities", None)
+            try:
+                await self._call("editMessageText", params)
+                return True
+            except AdapterError as exc:
+                if exc.code == 400 and "not modified" in exc.description.lower():
+                    return True  # محتوا عوض نشده؛ پیام همون صفحه‌ست
+                if exc.code == 400 and use_entities:
+                    log.info("edit with entities rejected; retrying without formatting")
+                    continue
+                log.info("editMessageText failed (code %s): %s", exc.code, exc.description)
+                return False
+        return False
 
     async def send_document(self, chat_id, filename, data, caption="") -> bool:
         assert self._http is not None

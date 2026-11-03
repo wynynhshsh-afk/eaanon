@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .base import (
     Adapter, AdapterError, IncomingCallback, IncomingMessage, Keyboard, Update,
@@ -13,6 +13,7 @@ class FakeAdapter(Adapter):
     def __init__(self) -> None:
         self.bot_username = "testbot"
         self.sent: List[Tuple[str, str, Optional[Keyboard]]] = []
+        self.sent_entities: List[Optional[List[Dict[str, Any]]]] = []  # موازی با sent
         self.pending: List[Update] = []
         self.fail_for: Set[str] = set()
         self.media_ok = True
@@ -28,11 +29,12 @@ class FakeAdapter(Adapter):
         out, self.pending = self.pending, []
         return out
 
-    async def send_message(self, chat_id, text, keyboard=None):
+    async def send_message(self, chat_id, text, keyboard=None, entities=None):
         if str(chat_id) in self.fail_for:
             raise AdapterError("forbidden", code=403)
         self._mid += 1
         self.sent.append((str(chat_id), text, keyboard))
+        self.sent_entities.append(entities or None)
         return str(self._mid)
 
     async def answer_callback(self, callback_id, text=None):
@@ -44,11 +46,12 @@ class FakeAdapter(Adapter):
         self.relayed.append((str(to_chat_id), str(from_chat_id), str(message_id)))
         return True
 
-    async def edit_message(self, chat_id, message_id, text, keyboard=None):
+    async def edit_message(self, chat_id, message_id, text, keyboard=None, entities=None):
         if not self.edit_ok or str(chat_id) in self.fail_for:
             return False
         self.edits.append((str(chat_id), str(message_id), text, keyboard))
         self.sent.append((str(chat_id), text, keyboard))  # آخرین وضعیت صفحه
+        self.sent_entities.append(entities or None)
         return True
 
     async def send_document(self, chat_id, filename, data, caption=""):
@@ -71,6 +74,9 @@ class FakeAdapter(Adapter):
             if c == str(chat_id):
                 return t, k
         return None
+
+    def entities_to(self, chat_id: str) -> List[Optional[List[Dict[str, Any]]]]:
+        return [e for (c, _, _), e in zip(self.sent, self.sent_entities) if c == str(chat_id)]
 
     def buttons_to(self, chat_id: str) -> List[str]:
         last = self.last_to(chat_id)
